@@ -1,9 +1,12 @@
 use std::ffi::OsStr;
 use std::fmt::{Display, Formatter};
 use std::path::Path;
+use std::pin::Pin;
 
 use enum_display::EnumDisplay;
+use futures::Stream;
 use log::debug;
+use martin_tile_utils::TileCoord;
 use serde::{Deserialize, Serialize};
 use sqlite_compressions::{register_bsdiffraw_functions, register_gzip_functions};
 use sqlite_hashes::register_md5_functions;
@@ -129,6 +132,40 @@ impl Mbtiles {
             .execute(conn)
             .await?;
         Ok(())
+    }
+
+    /// Returns a stream over coordinates of all the tiles in the database.
+    pub fn all_tile_coords<'e, T>(
+        &self,
+        conn: &'e mut T,
+    ) -> Pin<Box<dyn Stream<Item = MbtResult<TileCoord>> + Send + 'e>>
+    where
+        &'e mut T: SqliteExecutor<'e>,
+    {
+        use futures::StreamExt;
+
+        let query = query! {"SELECT zoom_level, tile_column, tile_row, tile_data FROM tiles"};
+        let stream = query.fetch(conn);
+        let filepath = self.filepath.clone();
+
+        Box::pin(stream.map(move |result| {
+            result.map_err(MbtError::from).and_then(|row| {
+                if let Some(z) = parse_tile_coord(row.zoom_level) {
+                    if let Some(x) = parse_tile_coord(row.tile_column) {
+                        if let Some(y) = parse_tile_coord(row.tile_row) {
+                            let y = invert_y_value(z, y);
+                            return Ok(TileCoord { z, x, y });
+                        }
+                    }
+                }
+                Err(MbtError::InvalidTileIndex(
+                    filepath.clone(),
+                    format!("{:?}", row.zoom_level),
+                    format!("{:?}", row.tile_column),
+                    format!("{:?}", row.tile_row),
+                ))
+            })
+        }))
     }
 
     /// Get a tile from the database
@@ -281,6 +318,13 @@ pub async fn attach_sqlite_fn(conn: &mut SqliteConnection) -> MbtResult<()> {
     register_bsdiffraw_functions(&rc)?;
     register_gzip_functions(&rc)?;
     Ok(())
+}
+
+fn parse_tile_coord<T>(source: Option<i64>) -> Option<T>
+where
+    T: TryFrom<i64>,
+{
+    source.and_then(|s| s.try_into().ok())
 }
 
 #[cfg(test)]
